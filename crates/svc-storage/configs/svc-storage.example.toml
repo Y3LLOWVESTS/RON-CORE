@@ -1,0 +1,6 @@
+bind = "127.0.0.1:5303"
+data_dir = "./data/storage"
+read_timeout_ms = 5000
+write_timeout_ms = 5000
+max_body_bytes = 1048576
+amnesia = false

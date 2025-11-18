@@ -1,0 +1,8 @@
+[build]
+rustflags = ["-Cdebuginfo=1"]
+
+[target.'cfg(unix)']
+rustflags = ["-C", "link-arg=-Wl,-O1"]
+
+[term]
+verbose = true

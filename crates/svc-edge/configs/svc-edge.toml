@@ -1,0 +1,6 @@
+# Minimal runnable config (admin plane only in this increment).
+bind_addr = "0.0.0.0:8080"
+metrics_addr = "127.0.0.1:9909"
+
+[security]
+amnesia = true

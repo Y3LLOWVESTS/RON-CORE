@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ron-kernel",
+  "crates/ron-bus",
+  "crates/ron-metrics",
+  "crates/ron-proto",
+  "crates/oap",
+  "crates/svc-overlay",
+  "crates/ron-transport",
+  "crates/svc-dht",
+  "crates/ron-naming",
+  "crates/svc-storage",
+  "crates/svc-index",
+  "crates/ron-policy",
+  "crates/omnigate",
+  "crates/svc-gateway",
+  "crates/micronode",
+  "crates/ron-kms",
+  "crates/svc-passport",
+  "crates/ron-auth",
+  "crates/svc-registry",
+  "crates/svc-edge",
+  "crates/ron-audit",
+  "crates/ron-app-sdk",
+]
+
+# Shared pins to minimize duplicates across the workspace.
+[workspace.dependencies]
+# Core async / HTTP stack
+tokio        = { version = "1", default-features = false }
+axum         = { version = "0.7.9", default-features = false }
+# Unify Tower across the workspace; expose "util" for ServiceBuilder etc.
+tower        = { version = "0.5.2", default-features = false, features = ["util"] }
+tower-http   = "0.6.6"
+http         = "1"
+tokio-util   = "0.7"
+reqwest      = { version = "0.12", default-features = false }
+tokio-rustls = "0.26.4"
+
+# Telemetry
+tracing            = "0.1"
+tracing-subscriber = "0.3"
+prometheus         = "0.14"
+
+# Serde & config
+serde           = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json      = "1"
+toml            = "0.8"
+humantime-serde = "1"
+
+# Misc utilities
+thiserror    = "1"
+anyhow       = "1"
+bytes        = "1"
+once_cell    = "1.19"
+parking_lot  = "0.12"
+futures      = "0.3"
+futures-util = "0.3"
+rand         = "0.9"
+fastrand     = "2.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "debuginfo"
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"   # optional, workspace-wide
+
+

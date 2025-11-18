@@ -1,0 +1,4 @@
+[alias]
+fmt = "fmt --all"
+clippy = "clippy --all-targets -- -D warnings"
+test-all = "test --all-features"

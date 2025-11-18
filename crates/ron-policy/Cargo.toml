@@ -1,0 +1,53 @@
+[package]
+name = "ron-policy"
+version = "0.1.0-beta.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Declarative policy engine for RustyOnions (deny-by-default, quotas, geo, residency, reasons/obligations)"
+repository = "https://example.invalid/RustyOnions"
+authors = ["RustyOnions Contributors"]
+rust-version = "1.78"
+
+[lib]
+name = "ron_policy"
+path = "src/lib.rs"
+
+[features]
+# Tight JSON/TOML parsing with #[serde(deny_unknown_fields)] everywhere.
+strict = []
+# Avoids time dependencies in core; enables std::time-based clock by default.
+default = ["strict"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+bytes = "1.7"
+prometheus = "0.14"
+regex = "1.10"
+# NOTE: we migrated metrics statics to std::sync::LazyLock, so once_cell is no longer needed.
+
+[dev-dependencies]
+criterion = "0.5"
+insta = { version = "1.43", features = ["json"] }
+rand = "0.9"
+pico-args = "0.5"        # for examples/ron_policy_cli.rs
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["prometheus"]
+
+[[bench]]
+name = "eval_throughput"
+harness = false
+
+# Explicitly list the CLI example so it builds with dev-deps.
+[[example]]
+name = "ron_policy_cli"
+path = "examples/ron_policy_cli.rs"
+
+# Minimal example runs without extra deps; auto-discovery also works,
+# but we keep it explicit for clarity.
+[[example]]
+name = "minimal_allow_deny"
+path = "examples/minimal_allow_deny.rs"
