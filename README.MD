@@ -263,6 +263,8 @@ please open an issue or discussion in this repo with:
 * which crates you’re touching,
 * and any logs/tests you’ve already run.
 
-RON-CORE is designed to be **approachable** despite the depth: small services, clear invariants, and copy-pasteable examples everywhere.
+## 🙌 Credits
+
+Created by **Stevan White** with assistance from **OpenAI’s ChatGPT** and **xAI’s Grok**.
 
 ```
