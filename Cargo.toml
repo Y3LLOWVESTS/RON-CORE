@@ -16,6 +16,7 @@ members = [
   "crates/omnigate",
   "crates/svc-gateway",
   "crates/micronode",
+  "crates/macronode",
   "crates/ron-kms",
   "crates/svc-passport",
   "crates/ron-auth",
@@ -23,6 +24,7 @@ members = [
   "crates/svc-edge",
   "crates/ron-audit",
   "crates/ron-app-sdk",
+  "crates/svc-mailbox",
 ]
 
 # Shared pins to minimize duplicates across the workspace.
