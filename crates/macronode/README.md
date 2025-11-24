@@ -16,8 +16,6 @@ Badges (truthful):
 
 ---
 
->Update 11-23-25: ron-app-sdk-ts (typescript) & ron-app-sdk-py (python) now beta complete, next is ron-app-sdk-php. We have other sdk folders but they are just stubs for now. Important to note that although RON-CORE is written in rust it is meant to have polyglot functionality for both the frontend or backend.
-
 ## 1) Overview
 
 **What it is:**  
