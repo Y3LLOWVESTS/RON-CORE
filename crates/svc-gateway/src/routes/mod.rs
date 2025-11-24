@@ -1,8 +1,9 @@
 //! Router assembly + core admin plane.
-//! RO:ORDER  Keep layers minimal; apply correlation + HTTP metrics to `/healthz`,
-//!           request-timeout + concurrency cap to `/readyz`, and body cap / rate limit
-//!           only to dev routes. Optionally add `http_metrics` to dev routes when
-//!           `SVC_GATEWAY_DEV_METRICS` is truthy for benching visibility.
+//!
+//! RO:ORDER  Keep layers minimal; apply correlation + HTTP metrics to `/healthz` and the
+//!           app-plane `/app/*` subtree, request-timeout + concurrency cap to `/readyz`,
+//!           and body cap / rate limit only to dev routes. Optionally add `http_metrics`
+//!           to dev routes when `SVC_GATEWAY_DEV_METRICS` is truthy for benching visibility.
 
 use crate::state::AppState;
 use axum::{
@@ -10,11 +11,11 @@ use axum::{
     Router,
 };
 
+pub mod app;
 pub mod dev;
 pub mod health;
 mod metrics;
 pub mod ready;
-pub mod version; // <— NEW
 
 /// Return true if `SVC_GATEWAY_DEV_METRICS` is set to a truthy value.
 /// Accepted values (case-insensitive): "1", "true", "yes", "on".
@@ -78,11 +79,20 @@ pub fn build_router(state: &AppState) -> Router {
         Router::new()
     };
 
+    // --- /app/*: app-plane proxy to omnigate with correlation + metrics ---
+    let app_routes = Router::new()
+        // App-plane proxy: /app/* → omnigate /v1/app/*
+        .nest("/app", app::router())
+        .route_layer(axum::middleware::from_fn(crate::layers::corr::mw))
+        .route_layer(axum::middleware::from_fn(
+            crate::observability::http_metrics::mw,
+        ));
+
     Router::new()
         .merge(health_with_layers)
         .merge(ready_with_guards)
         .merge(dev_routes)
+        .merge(app_routes)
         .route("/metrics", get(metrics::get_metrics))
-        .route("/version", get(version::handler)) // <— NEW
         .with_state(state.clone())
 }

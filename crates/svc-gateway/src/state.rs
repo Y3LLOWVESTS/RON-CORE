@@ -1,5 +1,5 @@
 //! RO:WHAT   Process state container passed to handlers and layers.
-//! RO:WHY    Centralizes config, metrics handles, and readiness gate.
+//! RO:WHY    Centralizes config, metrics handles, readiness gate, and shared clients.
 //! RO:INVARS Send + Sync; cheap to clone via Arcs.
 
 use std::sync::Arc;
@@ -7,12 +7,15 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::observability::metrics::{self, MetricsHandles};
 use crate::readiness::ReadyState;
+use reqwest::Client;
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Config,
     pub metrics: MetricsHandles,
     pub readiness: Arc<ReadyState>,
+    /// Shared HTTP client for talking to omnigate app plane.
+    pub omnigate_client: Client,
 }
 
 impl AppState {
@@ -23,6 +26,7 @@ impl AppState {
             cfg,
             metrics,
             readiness: Arc::new(ReadyState::new()),
+            omnigate_client: Client::new(),
         }
     }
 
