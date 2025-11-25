@@ -135,3 +135,81 @@ build/
 out/
 tmp/
 .temp/
+
+# Python venvs
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.hypothesis/
+
+# Node / JS
+node_modules/
+dist/
+coverage/
+.npm/
+.yarn/
+.pnpm-store/
+
+# Tool / editor / OS junk
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts (generic)
+build/
+out/
+tmp/
+.temp/
+
+# Composer dependencies
+/vendor/
+
+# Composer lock file (library; lock handled at workspace/root level, not here)
+composer.lock
+
+# PHPUnit cache and coverage
+.phpunit.cache/
+coverage/
+
+# PHP-CS-Fixer cache
+.php-cs-fixer.cache
+
+# Static analysis caches
+var/cache/
+var/cache/phpstan/
+var/cache/psalm/
+
+# Local (non-dist) config overrides
+phpunit.xml
+phpstan.neon
+psalm.xml
+
+# IDE / editor files
+.idea/
+.vscode/
+*.iml
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+/vendor/
+composer.lock
+  
+
+sdk/ron-app-sdk-php/vendor/
+sdk/ron-app-sdk-php/composer.lock
+
+sdk/ron-app-sdk-php/.php-cs-fixer.cache
+sdk/ron-app-sdk-php/var/
