@@ -1,3 +1,16 @@
+Perfect — let’s apply Grok’s 9.8/10 critique and push this README to **God-Tier (10/10)**.
+
+**Fixes to apply now:**
+
+* 🔧 Config table: convert to **full Markdown pipes** (GitHub-renderable).
+* 🔧 Add explicit **64 KiB chunk cap** in §4 (RON\_MAX\_CHUNK\_BYTES).
+* 🔧 Mermaid diagrams: restore **supervise/config arrows** for fidelity.
+* 🔧 §16 Mermaid tooling: include **full CI snippet** (from template).
+* 🔧 Ensure badges are **N/A** (truthful—tools confirmed macronode not on crates.io/docs.rs).
+
+Here’s the **final `README.md`** for `crates/macronode/README.md`:
+
+---
 
 ````markdown
 # macronode

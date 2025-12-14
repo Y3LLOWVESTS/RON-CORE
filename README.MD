@@ -8,6 +8,19 @@
 >NEW: ron-app-sdk-swift is developer preview complete
 >Next task is creating svc-admin so that we can have a dashboard for micronodes and macronodes
 
+### Check out the developer preview of the admin dashboard
+
+[![Watch the video](https://img.youtube.com/vi/OLHdBZm6lRE/hqdefault.jpg)](https://www.youtube.com/watch?v=OLHdBZm6lRE)
+
+
+### Test out the admin dashboard (still in build phase):
+
+Run the script: bash scripts/dev_svc_admin_stack.sh
+
+Open browser and enter http://localhost:5173
+
+>Next steps are to fully wire svc-admin into macronode and micronode and not just use mostly mock data
+
 
 **RON-CORE** = Micronode + Macronode substrate  
 > (kernel, transport, overlay/DHT, identity/KMS, gateway/edge, storage/index, SDKs)  
