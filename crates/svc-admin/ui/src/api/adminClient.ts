@@ -1,9 +1,14 @@
 // crates/svc-admin/ui/src/api/adminClient.ts
 //
-// RO:WHAT - Thin fetch wrapper for svc-admin backend APIs.
-// RO:WHY  - Keep all HTTP paths and DTO wiring in one place so routes
-//           and components stay simple and testable.
-// RO:INTERACTS - types/admin-api.ts, Rust router.rs JSON contracts.
+// RO:WHAT — Thin HTTP client for the svc-admin backend API.
+// RO:WHY  — Centralize fetch + error shaping + JSON parsing for SPA routes.
+// RO:INVARIANTS —
+//   - All methods are read-only unless explicitly named as an action.
+//   - Errors include `status` when available so callers can classify 404/501/etc.
+//   - No implicit retries here (UI controls fetch cadence).
+//   - Dev-only request logging is passive and bounded (ring buffer).
+//
+// NOTE: This file is a drop-in replacement for the common pattern used in svc-admin UI.
 
 import type {
   UiConfigDto,
@@ -12,153 +17,379 @@ import type {
   AdminStatusView,
   FacetMetricsSummary,
   NodeActionResponse,
-
-  // Storage (Slice 3)
   StorageSummaryDto,
   DatabaseEntryDto,
   DatabaseDetailDto,
+  PlaygroundExampleDto,
+  PlaygroundValidateManifestReq,
+  PlaygroundValidateManifestResp,
+  SystemSummaryDto,
 } from '../types/admin-api'
 
-// Base URL strategy:
-//
-// - In dev, we want to use *relative* URLs ("/api/...") so Vite can proxy
-//   to the backend and we avoid CORS completely.
-// - In production, the SPA is normally served by svc-admin itself, so
-//   relative URLs still work (same origin).
-// - If you *really* want to point at a remote svc-admin, set
-//   VITE_SVC_ADMIN_BASE_URL and we'll prefix with that.
-const RAW_BASE_URL: string =
-  (import.meta as any).env?.VITE_SVC_ADMIN_BASE_URL ??
-  (import.meta as any).env?.VITE_API_BASE_URL ??
-  ''
+export type HttpError = Error & { status?: number; body?: string }
 
-function buildUrl(path: string): string {
-  if (!RAW_BASE_URL) return path
-  const base = RAW_BASE_URL.replace(/\/+$/, '')
-  return `${base}${path}`
+function makeHttpError(message: string, status?: number, body?: string): HttpError {
+  const err = new Error(message) as HttpError
+  if (typeof status === 'number') err.status = status
+  if (typeof body === 'string') err.body = body
+  return err
 }
 
-type FetchError = Error & { status?: number; statusText?: string }
+export function isHttpError(err: unknown): err is HttpError {
+  return !!err && typeof err === 'object' && ('status' in err || 'body' in err)
+}
 
-async function handleResponse<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    let bodyText = ''
+async function readTextSafe(r: Response): Promise<string> {
+  try {
+    return await r.text()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Dev-only request log (bounded ring buffer).
+ * WHY: During macronode integration, seeing the last N API calls, status codes,
+ *      and timings prevents “it looks the same” / “is it broken?” loops.
+ */
+export type HttpLogEntry = {
+  id: string
+  at: string // ISO timestamp
+  method: string
+  path: string
+  status?: number
+  ok?: boolean
+  duration_ms: number
+  error?: string
+  body_snippet?: string
+}
+
+type Listener = (entries: HttpLogEntry[]) => void
+
+const MAX_LOG = 80
+let logEntries: HttpLogEntry[] = []
+const listeners = new Set<Listener>()
+
+function pushLog(entry: HttpLogEntry) {
+  logEntries = [entry, ...logEntries].slice(0, MAX_LOG)
+  for (const fn of listeners) {
     try {
-      bodyText = await res.text()
+      fn(logEntries)
     } catch {
-      // ignore secondary errors
+      // no-op
     }
+  }
+}
 
-    const msg =
-      bodyText && bodyText.length < 1024
-        ? `Request failed: ${res.status} ${res.statusText} - ${bodyText}`
-        : `Request failed: ${res.status} ${res.statusText}`
+function nowIso(): string {
+  return new Date().toISOString()
+}
 
-    const err = new Error(msg) as FetchError
-    err.status = res.status
-    err.statusText = res.statusText
-    throw err
+function randomId(): string {
+  // Enough uniqueness for a dev ring buffer.
+  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)
+}
+
+export const httpLog = {
+  getEntries(): HttpLogEntry[] {
+    return logEntries
+  },
+  subscribe(fn: Listener): () => void {
+    listeners.add(fn)
+    // push current immediately for convenience
+    try {
+      fn(logEntries)
+    } catch {
+      // no-op
+    }
+    return () => {
+      listeners.delete(fn)
+    }
+  },
+  clear(): void {
+    logEntries = []
+    for (const fn of listeners) {
+      try {
+        fn(logEntries)
+      } catch {
+        // no-op
+      }
+    }
+  },
+}
+
+function buildHeaders(init?: RequestInit): HeadersInit {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
   }
 
-  const text = await res.text()
-  if (!text) return undefined as unknown as T
-  return JSON.parse(text) as T
+  // Only set Content-Type if we actually have a body (or caller explicitly set it).
+  // This keeps GETs "simple" and avoids surprises if we ever go cross-origin.
+  const hasBody = typeof init?.body !== 'undefined' && init?.body !== null
+  if (hasBody) headers['Content-Type'] = 'application/json'
+
+  return {
+    ...headers,
+    ...(init?.headers ?? {}),
+  }
 }
 
-async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(buildUrl(path), init)
-  return handleResponse<T>(res)
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = init?.method ?? 'GET'
+  const started = performance.now()
+  const id = randomId()
+  let logged = false
+
+  try {
+    const r = await fetch(path, {
+      ...init,
+      headers: buildHeaders(init),
+    })
+
+    const duration_ms = Math.max(0, performance.now() - started)
+
+    if (!r.ok) {
+      const body = await readTextSafe(r)
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        status: r.status,
+        ok: false,
+        duration_ms,
+        error: `${method} ${path} → ${r.status}`,
+        body_snippet: body.slice(0, 600),
+      })
+      logged = true
+      throw makeHttpError(`${method} ${path} → ${r.status}`, r.status, body)
+    }
+
+    // Some endpoints might return empty body; keep it strict and fail loudly.
+    try {
+      const json = (await r.json()) as T
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        status: r.status,
+        ok: true,
+        duration_ms,
+      })
+      logged = true
+      return json
+    } catch (e: any) {
+      const body = await readTextSafe(r)
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        status: r.status,
+        ok: false,
+        duration_ms,
+        error: `Failed to parse JSON from ${path}: ${String(e)}`,
+        body_snippet: body.slice(0, 600),
+      })
+      logged = true
+      throw makeHttpError(`Failed to parse JSON from ${path}: ${String(e)}`, r.status, body)
+    }
+  } catch (e: any) {
+    const duration_ms = Math.max(0, performance.now() - started)
+
+    // Only log here if we didn't already log a non-2xx or JSON parse error above.
+    // This path is intended for network/CORS/abort failures.
+    if (!logged) {
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        ok: false,
+        duration_ms,
+        error: e?.message ? String(e.message) : 'Request failed',
+      })
+    }
+
+    throw e
+  }
+}
+
+/**
+ * Request JSON, but treat "missing endpoint" as null.
+ * Useful for capability rollout (e.g. /system/summary not present on older nodes).
+ */
+async function requestMaybeJson<T>(path: string, init?: RequestInit): Promise<T | null> {
+  try {
+    return await requestJson<T>(path, init)
+  } catch (e: any) {
+    if (isHttpError(e)) {
+      const s = e.status
+      if (s === 404 || s === 405 || s === 501) return null
+    }
+    throw e
+  }
+}
+
+async function requestVoid(path: string, init?: RequestInit): Promise<void> {
+  const method = init?.method ?? 'GET'
+  const started = performance.now()
+  const id = randomId()
+  let logged = false
+
+  try {
+    const r = await fetch(path, {
+      ...init,
+      headers: buildHeaders(init),
+    })
+
+    const duration_ms = Math.max(0, performance.now() - started)
+
+    if (!r.ok) {
+      const body = await readTextSafe(r)
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        status: r.status,
+        ok: false,
+        duration_ms,
+        error: `${method} ${path} → ${r.status}`,
+        body_snippet: body.slice(0, 600),
+      })
+      logged = true
+      throw makeHttpError(`${method} ${path} → ${r.status}`, r.status, body)
+    }
+
+    pushLog({
+      id,
+      at: nowIso(),
+      method,
+      path,
+      status: r.status,
+      ok: true,
+      duration_ms,
+    })
+    logged = true
+  } catch (e: any) {
+    const duration_ms = Math.max(0, performance.now() - started)
+    if (!logged) {
+      pushLog({
+        id,
+        at: nowIso(),
+        method,
+        path,
+        ok: false,
+        duration_ms,
+        error: e?.message ? String(e.message) : 'Request failed',
+      })
+    }
+    throw e
+  }
 }
 
 export const adminClient = {
-  // --- Core config / identity ---------------------------------------------
+  // ---- UI/meta -----------------------------------------------------------
 
   async getUiConfig(): Promise<UiConfigDto> {
-    return fetchJson<UiConfigDto>('/api/ui-config')
+    return requestJson<UiConfigDto>('/api/ui-config')
   },
 
   async getMe(): Promise<MeResponse> {
-    return fetchJson<MeResponse>('/api/me')
+    return requestJson<MeResponse>('/api/me')
   },
 
-  // --- Nodes listing / status ---------------------------------------------
+  // ---- Nodes -------------------------------------------------------------
 
   async getNodes(): Promise<NodeSummary[]> {
-    return fetchJson<NodeSummary[]>('/api/nodes')
+    return requestJson<NodeSummary[]>('/api/nodes')
   },
 
   async getNodeStatus(id: string): Promise<AdminStatusView> {
-    return fetchJson<AdminStatusView>(
-      `/api/nodes/${encodeURIComponent(id)}/status`,
-    )
+    return requestJson<AdminStatusView>(`/api/nodes/${encodeURIComponent(id)}/status`)
   },
 
   async getNodeFacetMetrics(id: string): Promise<FacetMetricsSummary[]> {
-    return fetchJson<FacetMetricsSummary[]>(
+    return requestJson<FacetMetricsSummary[]>(
       `/api/nodes/${encodeURIComponent(id)}/metrics/facets`,
     )
   },
 
-  // --- Node storage (read-only) -------------------------------------------
-  //
-  // These endpoints may return 404/501 until node/admin-plane support exists.
-  // Callers should be prepared to fall back to mock data.
+  // ---- System (capability rollout; may be missing) -----------------------
+
+  async getNodeSystemSummary(id: string): Promise<SystemSummaryDto | null> {
+    return requestMaybeJson<SystemSummaryDto>(
+      `/api/nodes/${encodeURIComponent(id)}/system/summary`,
+    )
+  },
+
+  // ---- Storage (read-only) ----------------------------------------------
 
   async getNodeStorageSummary(id: string): Promise<StorageSummaryDto> {
-    return fetchJson<StorageSummaryDto>(
+    return requestJson<StorageSummaryDto>(
       `/api/nodes/${encodeURIComponent(id)}/storage/summary`,
     )
   },
 
-  async getNodeDatabases(id: string): Promise<DatabaseEntryDto[]> {
-    return fetchJson<DatabaseEntryDto[]>(
+  async getNodeStorageDatabases(id: string): Promise<DatabaseEntryDto[]> {
+    return requestJson<DatabaseEntryDto[]>(
       `/api/nodes/${encodeURIComponent(id)}/storage/databases`,
     )
   },
 
-  async getNodeDatabaseDetail(
-    id: string,
-    name: string,
-  ): Promise<DatabaseDetailDto> {
-    return fetchJson<DatabaseDetailDto>(
-      `/api/nodes/${encodeURIComponent(id)}/storage/databases/${encodeURIComponent(
-        name,
-      )}`,
+  async getNodeStorageDatabaseDetail(id: string, name: string): Promise<DatabaseDetailDto> {
+    return requestJson<DatabaseDetailDto>(
+      `/api/nodes/${encodeURIComponent(id)}/storage/databases/${encodeURIComponent(name)}`,
     )
   },
 
-  // --- Node control actions -----------------------------------------------
+  // ---- Node actions (mutating; backend will gate) -------------------------
 
   async reloadNode(id: string): Promise<NodeActionResponse> {
-    return fetchJson<NodeActionResponse>(
-      `/api/nodes/${encodeURIComponent(id)}/reload`,
-      { method: 'POST' },
-    )
+    return requestJson<NodeActionResponse>(`/api/nodes/${encodeURIComponent(id)}/reload`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
   },
 
   async shutdownNode(id: string): Promise<NodeActionResponse> {
-    return fetchJson<NodeActionResponse>(
-      `/api/nodes/${encodeURIComponent(id)}/shutdown`,
-      { method: 'POST' },
-    )
+    return requestJson<NodeActionResponse>(`/api/nodes/${encodeURIComponent(id)}/shutdown`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
   },
 
-  // --- Dev-only: synthetic crash proxy ------------------------------------
-
-  async debugCrashNode(
-    id: string,
-    service?: string,
-  ): Promise<NodeActionResponse> {
-    const payload: { service?: string } = {}
-    if (service) payload.service = service
-
-    return fetchJson<NodeActionResponse>(
+  async debugCrashNode(id: string, service?: string | null): Promise<NodeActionResponse> {
+    return requestJson<NodeActionResponse>(
       `/api/nodes/${encodeURIComponent(id)}/debug/crash`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ service: service ?? null }),
       },
     )
+  },
+
+  // ---- Playground (dev-only, read-only MVP) ------------------------------
+
+  async getPlaygroundExamples(): Promise<PlaygroundExampleDto[]> {
+    return requestJson<PlaygroundExampleDto[]>('/api/playground/examples')
+  },
+
+  async validatePlaygroundManifest(
+    manifestToml: string,
+  ): Promise<PlaygroundValidateManifestResp> {
+    const req: PlaygroundValidateManifestReq = { manifestToml }
+    return requestJson<PlaygroundValidateManifestResp>('/api/playground/manifest/validate', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+  },
+
+  // ---- Misc --------------------------------------------------------------
+
+  async ping(): Promise<void> {
+    return requestVoid('/healthz', { method: 'GET' })
   },
 }

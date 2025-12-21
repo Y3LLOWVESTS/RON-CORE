@@ -5,669 +5,217 @@
 //   - Left: planes table, facet metrics, actions, debug.
 //   - Right: NodeDetailSidebar with "Data & storage" + "Playground" stubs.
 // WHY:
-//   Matches the God-tier mock: main operational view on the left, curated
-//   data-plane + tinkering surface on the right.
+//   Keep this route thin + compositional; heavy logic lives in a hook and
+//   route-local helpers to improve maintainability and reduce 1k+ LOC files.
+// INTERACTS:
+//   - routes/node-detail/useNodeDetail.ts        (polling/actions/debug)
+//   - routes/node-detail/*                       (pure helpers + gauges)
+//   - components/nodes/*                         (tables/badges/sidebar)
+// INVARIANTS:
+//   - No conditional hooks; polling uses stable effects.
+//   - UI supports safe mock fallback patterns.
+// SECURITY:
+//   - Mutations gated by server-side config + roles (same as before).
 
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
-import { adminClient } from '../api/adminClient'
-import type {
-  AdminStatusView,
-  FacetMetricsSummary,
-  NodeActionResponse,
-} from '../types/admin-api'
+
 import { PlaneStatusTable } from '../components/nodes/PlaneStatusTable'
 import { NodeStatusBadge } from '../components/nodes/NodeStatusBadge'
 import { FacetMetricsPanel } from '../components/metrics/FacetMetricsPanel'
 import { LoadingSpinner } from '../components/shared/LoadingSpinner'
 import { ErrorBanner } from '../components/shared/ErrorBanner'
-import { useI18n } from '../i18n/useI18n'
-import type { MetricsHealth } from '../components/nodes/NodeCard'
 import { NodeDetailSidebar } from '../components/nodes/NodeDetailSidebar'
+import type { MetricsHealth } from '../components/nodes/NodeCard'
 
-type Health = 'healthy' | 'degraded' | 'down'
+import { adminClient } from '../api/adminClient'
+import type { StorageSummaryDto, SystemSummaryDto } from '../types/admin-api'
 
-function deriveOverallHealth(planes: any[]): Health {
-  if (!planes.length) return 'degraded'
-  if (planes.some((p) => String(p.health ?? '').toLowerCase() === 'down'))
-    return 'down'
-  if (planes.some((p) => String(p.health ?? '').toLowerCase() === 'degraded'))
-    return 'degraded'
-  return 'healthy'
-}
+import { useNodeDetail } from './node-detail/useNodeDetail'
+import { deriveOverallHealth } from './node-detail/health'
+import { classifyMetricsHealth, renderMetricsBadge } from './node-detail/metricsHealth'
+import {
+  mockNodeUtilization,
+  seedFromString,
+  MiniMetricCard,
+  SpeedometerGauge,
+  ThermometerGauge,
+  StorageWaffleGauge,
+  BandwidthBarsGauge,
+} from './node-detail/utilization'
+import { computePlaneSummary, Pill } from './node-detail/planeSummary'
 
-function classifyMetricsHealth(
-  facets: FacetMetricsSummary[] | null,
-  error: string | null,
-): MetricsHealth | null {
-  if (error) return 'unreachable'
-  if (!facets || facets.length === 0) return 'stale'
+type FetchErr = Error & { status?: number }
 
-  const ages = facets
-    .map((f) => f.last_sample_age_secs)
-    .filter((v): v is number => v !== null && Number.isFinite(v))
+function isMissingEndpoint(err: unknown): boolean {
+  const e = err as FetchErr
+  const s = e && typeof e.status === 'number' ? e.status : undefined
+  if (s === 404 || s === 405 || s === 501) return true
 
-  if (ages.length === 0) return 'stale'
-
-  const minAge = Math.min(...ages)
-  const FRESH_THRESHOLD_SECS = 30
-  return minAge <= FRESH_THRESHOLD_SECS ? 'fresh' : 'stale'
-}
-
-function renderMetricsBadge(health: MetricsHealth | null) {
-  if (!health) return null
-
-  const base =
-    'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold'
-
-  if (health === 'fresh') {
-    return (
-      <span className={`${base} bg-emerald-500/10 text-emerald-300`}>
-        Metrics: fresh
-      </span>
-    )
-  }
-
-  if (health === 'stale') {
-    return (
-      <span className={`${base} bg-amber-500/10 text-amber-300`}>
-        Metrics: stale
-      </span>
-    )
-  }
-
+  const msg = e?.message ?? ''
   return (
-    <span className={`${base} bg-rose-500/10 text-rose-300`}>
-      Metrics: unreachable
-    </span>
+    msg.includes(' 404 ') ||
+    msg.includes(' 405 ') ||
+    msg.includes(' 501 ') ||
+    msg.toLowerCase().includes('not found') ||
+    msg.toLowerCase().includes('not implemented')
   )
 }
 
-function serviceForPlane(plane: string): string {
-  const trimmed = plane.trim()
-  if (!trimmed) return trimmed
-  if (trimmed.startsWith('svc-')) return trimmed
-
-  switch (trimmed) {
-    case 'gateway':
-      return 'svc-gateway'
-    case 'storage':
-      return 'svc-storage'
-    case 'index':
-      return 'svc-index'
-    case 'mailbox':
-      return 'svc-mailbox'
-    case 'overlay':
-      return 'svc-overlay'
-    case 'dht':
-      return 'svc-dht'
-    default:
-      return trimmed
-  }
+function clampPct(p: number): number {
+  if (!Number.isFinite(p)) return 0
+  return Math.max(0, Math.min(100, p))
 }
 
-// -------------------- CPU + RAM + Storage + Bandwidth (mock; deterministic per node) --------------------
-
-function seedFromString(s: string): number {
-  let acc = 0
-  for (let i = 0; i < s.length; i++) acc = (acc * 31 + s.charCodeAt(i)) >>> 0
-  return acc >>> 0
+function computeRamPct(sys: SystemSummaryDto | null): number | null {
+  if (!sys) return null
+  const total = sys.ramTotalBytes
+  const used = sys.ramUsedBytes
+  if (!Number.isFinite(total) || total <= 0) return null
+  const pct = (Math.max(0, used) / total) * 100
+  return clampPct(pct)
 }
 
-function clampPct(n: number): number {
-  if (!Number.isFinite(n)) return 0
-  return Math.max(0, Math.min(100, n))
+function computeStoragePct(st: StorageSummaryDto | null): number | null {
+  if (!st) return null
+  const total = st.totalBytes
+  const used = st.usedBytes
+  if (!Number.isFinite(total) || total <= 0) return null
+  const pct = (Math.max(0, used) / total) * 100
+  return clampPct(pct)
 }
 
-function mockNodeUtilization(nodeId: string): {
-  cpuPct: number
-  ramPct: number
-  storagePct: number
-  bandwidthPct: number
-} {
-  const seed = seedFromString(nodeId || 'node')
-  const cpu = 12 + (seed % 79) // 12..90
-  const ram = 25 + ((seed >>> 8) % 70) // 25..94
-  const storage = 18 + ((seed >>> 16) % 78) // 18..95
-  const bw = 8 + ((seed >>> 24) % 88) // 8..95
-  return {
-    cpuPct: clampPct(cpu),
-    ramPct: clampPct(ram),
-    storagePct: clampPct(storage),
-    bandwidthPct: clampPct(bw),
-  }
+function computeBandwidthPct(sys: SystemSummaryDto | null): number | null {
+  if (!sys) return null
+  const rx = sys.netRxBps
+  const tx = sys.netTxBps
+  const rxB = typeof rx === 'number' && Number.isFinite(rx) ? Math.max(0, rx) : 0
+  const txB = typeof tx === 'number' && Number.isFinite(tx) ? Math.max(0, tx) : 0
+
+  // If both are missing/null, treat as no live bandwidth.
+  if (!rx && !tx) return null
+
+  // Soft utilization: assume a 1 Gbps link until we expose link speed.
+  const usedBits = (rxB + txB) * 8
+  const assumedLinkBits = 1e9
+  const pct = (usedBits / assumedLinkBits) * 100
+  return clampPct(pct)
 }
 
-function MiniMetricCard(props: {
-  title: 'RAM' | 'CPU' | 'Storage' | 'Bandwidth'
-  children: React.ReactNode
-}) {
-  return (
-    <div
-      style={{
-        borderRadius: 16,
-        background:
-          'linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015))',
-        border: '1px solid var(--svc-admin-color-border, rgba(255,255,255,0.12))',
-        boxShadow: '0 10px 30px rgba(0,0,0,0.22)',
-        padding: '8px 10px',
-        minHeight: 80,
-        overflow: 'hidden',
-      }}
-    >
-      <div style={{ fontWeight: 900, letterSpacing: '0.02em' }}>
-        {props.title}
-      </div>
-      <div style={{ marginTop: 10 }}>{props.children}</div>
-    </div>
-  )
-}
+function useLiveUtilization(nodeId: string) {
+  const [system, setSystem] = useState<SystemSummaryDto | null>(null)
+  const [storage, setStorage] = useState<StorageSummaryDto | null>(null)
 
-function ThermometerGauge(props: { pct: number; compact?: boolean }) {
-  const pct = clampPct(props.pct)
-  const compact = props.compact ?? false
-  const fill = pct / 100
+  useEffect(() => {
+    if (!nodeId) {
+      setSystem(null)
+      setStorage(null)
+      return
+    }
 
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: compact ? '0.75rem' : '1rem',
-      }}
-    >
-      <div
-        style={{
-          width: compact ? 40 : 46,
-          height: compact ? 96 : 118,
-          borderRadius: 999,
-          position: 'relative',
-          overflow: 'hidden',
-          background: 'rgba(255,255,255,0.04)',
-          border: '1px solid var(--svc-admin-color-border, rgba(255,255,255,0.12))',
-          boxShadow: '0 0 0 1px rgba(0,0,0,0.18) inset',
-          flex: '0 0 auto',
-        }}
-        aria-hidden="true"
-      >
-        <div
-          style={{
-            position: 'absolute',
-            inset: 0,
-            opacity: 0.25,
-            background:
-              'linear-gradient(to bottom, rgba(255,255,255,0.12) 1px, transparent 1px)',
-            backgroundSize: '100% 14px',
-            pointerEvents: 'none',
-          }}
-        />
-        <div
-          style={{
-            position: 'absolute',
-            left: 6,
-            right: 6,
-            bottom: 6,
-            height: `calc(${fill * 100}% - 12px)`,
-            minHeight: 10,
-            borderRadius: 999,
-            background:
-              'linear-gradient(180deg, rgba(99,102,241,0.85) 0%, rgba(250,204,21,0.85) 55%, rgba(251,146,60,0.9) 80%, rgba(244,63,94,0.9) 100%)',
-            filter: 'saturate(1.15)',
-          }}
-        />
-        <div
-          style={{
-            position: 'absolute',
-            inset: 0,
-            background:
-              'linear-gradient(90deg, rgba(255,255,255,0.18), rgba(255,255,255,0.02) 55%, rgba(255,255,255,0.08))',
-            opacity: 0.12,
-            pointerEvents: 'none',
-          }}
-        />
-      </div>
+    let cancelled = false
 
-      <div style={{ minWidth: 0 }}>
-        <div
-          style={{
-            fontSize: compact ? '1.65rem' : '2rem',
-            fontWeight: 900,
-            lineHeight: 1,
-          }}
-        >
-          {pct.toFixed(0)}%
-        </div>
-        <div
-          style={{
-            fontSize: compact ? '0.82rem' : '0.9rem',
-            opacity: 0.78,
-            marginTop: 4,
-          }}
-        >
-          Memory in use (mock)
-        </div>
-      </div>
-    </div>
-  )
-}
+    ;(async () => {
+      // System summary is optional; missing endpoint -> ignore
+      try {
+        const s = await adminClient.getNodeSystemSummary(nodeId)
+        if (!cancelled) setSystem(s)
+      } catch (err) {
+        if (!cancelled) {
+          if (!isMissingEndpoint(err)) {
+            // keep quiet for now; we can surface later if desired
+            void err
+          }
+          setSystem(null)
+        }
+      }
 
-function SpeedometerGauge(props: { pct: number; compact?: boolean }) {
-  const pct = clampPct(props.pct)
-  const compact = props.compact ?? false
-  const angle = -110 + (pct / 100) * 220
+      // Storage summary is also optional in general (but you already have it)
+      try {
+        const st = await adminClient.getNodeStorageSummary(nodeId)
+        if (!cancelled) setStorage(st)
+      } catch (err) {
+        if (!cancelled) {
+          if (!isMissingEndpoint(err)) {
+            void err
+          }
+          setStorage(null)
+        }
+      }
+    })()
 
-  const cx = 78
-  const cy = 82
-  const r = 58
+    return () => {
+      cancelled = true
+    }
+  }, [nodeId])
 
-  const start = polarToCartesian(cx, cy, r, 200)
-  const end = polarToCartesian(cx, cy, r, -20)
-  const arcPath = describeArc(cx, cy, r, 200, -20)
+  const mock = useMemo(() => mockNodeUtilization(nodeId), [nodeId])
 
-  const svgW = compact ? 132 : 156
-  const svgH = compact ? 98 : 118
+  const cpuPct = useMemo(() => {
+    const live = system?.cpuPercent
+    if (typeof live === 'number' && Number.isFinite(live)) return clampPct(live)
+    return mock.cpuPct
+  }, [system, mock])
 
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: compact ? '0.75rem' : '1rem',
-      }}
-    >
-      <svg width={svgW} height={svgH} viewBox="0 0 156 118" aria-hidden="true">
-        <path
-          d={arcPath}
-          fill="none"
-          stroke="rgba(255,255,255,0.10)"
-          strokeWidth="12"
-          strokeLinecap="round"
-        />
-        <path
-          d={describeArc(cx, cy, r, 200, 200 - (pct / 100) * 220)}
-          fill="none"
-          stroke="rgba(99,102,241,0.85)"
-          strokeWidth="12"
-          strokeLinecap="round"
-        />
-        {Array.from({ length: 9 }).map((_, i) => {
-          const a = 200 - (i / 8) * 220
-          const p1 = polarToCartesian(cx, cy, r + 2, a)
-          const p2 = polarToCartesian(cx, cy, r - 10, a)
-          return (
-            <line
-              key={i}
-              x1={p1.x}
-              y1={p1.y}
-              x2={p2.x}
-              y2={p2.y}
-              stroke="rgba(255,255,255,0.12)"
-              strokeWidth={i % 2 === 0 ? 2 : 1}
-            />
-          )
-        })}
+  const ramPct = useMemo(() => {
+    const live = computeRamPct(system)
+    if (live != null) return live
+    return mock.ramPct
+  }, [system, mock])
 
-        <g transform={`rotate(${angle} ${cx} ${cy})`}>
-          <line
-            x1={cx}
-            y1={cy}
-            x2={cx + 54}
-            y2={cy}
-            stroke="rgba(191,219,254,0.95)"
-            strokeWidth="3"
-            strokeLinecap="round"
-          />
-          <circle cx={cx} cy={cy} r="7" fill="rgba(255,255,255,0.10)" />
-          <circle cx={cx} cy={cy} r="4" fill="rgba(99,102,241,0.95)" />
-        </g>
+  const storagePct = useMemo(() => {
+    const live = computeStoragePct(storage)
+    if (live != null) return live
+    return mock.storagePct
+  }, [storage, mock])
 
-        <circle cx={start.x} cy={start.y} r="3" fill="rgba(251,146,60,0.7)" />
-        <circle cx={end.x} cy={end.y} r="3" fill="rgba(16,185,129,0.55)" />
-      </svg>
+  const bandwidthPct = useMemo(() => {
+    const live = computeBandwidthPct(system)
+    if (live != null) return live
+    return mock.bandwidthPct
+  }, [system, mock])
 
-      <div style={{ minWidth: 0 }}>
-        <div
-          style={{
-            fontSize: compact ? '1.65rem' : '2rem',
-            fontWeight: 900,
-            lineHeight: 1,
-          }}
-        >
-          {pct.toFixed(0)}%
-        </div>
-        <div
-          style={{
-            fontSize: compact ? '0.82rem' : '0.9rem',
-            opacity: 0.78,
-            marginTop: 4,
-          }}
-        >
-          CPU utilization (mock)
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function StorageWaffleGauge(props: { pct: number; compact?: boolean }) {
-  const pct = clampPct(props.pct)
-  const compact = props.compact ?? false
-
-  const cols = 10
-  const rows = 5
-  const total = cols * rows
-  const filled = Math.round((pct / 100) * total)
-
-  const size = compact ? 12 : 14
-  const gap = compact ? 4 : 5
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: compact ? '0.75rem' : '1rem',
-      }}
-    >
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: `repeat(${cols}, ${size}px)`,
-          gridAutoRows: `${size}px`,
-          gap: `${gap}px`,
-          padding: 8,
-          borderRadius: 14,
-          background: 'rgba(255,255,255,0.03)',
-          border: '1px solid var(--svc-admin-color-border, rgba(255,255,255,0.12))',
-          boxShadow: '0 0 0 1px rgba(0,0,0,0.18) inset',
-          flex: '0 0 auto',
-        }}
-        aria-hidden="true"
-      >
-        {Array.from({ length: total }).map((_, i) => {
-          const on = i < filled
-          return (
-            <div
-              key={i}
-              style={{
-                width: size,
-                height: size,
-                borderRadius: 4,
-                background: on
-                  ? 'rgba(99,102,241,0.70)'
-                  : 'rgba(255,255,255,0.07)',
-                boxShadow: on ? '0 0 10px rgba(99,102,241,0.18)' : 'none',
-              }}
-            />
-          )
-        })}
-      </div>
-
-      <div style={{ minWidth: 0 }}>
-        <div
-          style={{
-            fontSize: compact ? '1.65rem' : '2rem',
-            fontWeight: 900,
-            lineHeight: 1,
-          }}
-        >
-          {pct.toFixed(0)}%
-        </div>
-        <div
-          style={{
-            fontSize: compact ? '0.82rem' : '0.9rem',
-            opacity: 0.78,
-            marginTop: 4,
-          }}
-        >
-          Storage used (mock)
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function BandwidthBarsGauge(props: { pct: number; seed: number; compact?: boolean }) {
-  const pct = clampPct(props.pct)
-  const compact = props.compact ?? false
-
-  const bars = 14
-  const active = Math.max(1, Math.round((pct / 100) * bars))
-
-  const barW = compact ? 7 : 8
-  const barGap = compact ? 5 : 6
-  const maxH = compact ? 44 : 52
-  const baseH = compact ? 14 : 16
-
-  const colorForIndex = (idx: number) => {
-    const t = idx / Math.max(1, bars - 1) // 0..1
-    if (t < 0.6) return 'rgba(34,197,94,0.85)'
-    if (t < 0.85) return 'rgba(250,204,21,0.85)'
-    return 'rgba(244,63,94,0.85)'
-  }
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: compact ? '0.75rem' : '1rem',
-      }}
-    >
-      <div
-        style={{
-          padding: 10,
-          borderRadius: 14,
-          background: 'rgba(255,255,255,0.03)',
-          border: '1px solid var(--svc-admin-color-border, rgba(255,255,255,0.12))',
-          boxShadow: '0 0 0 1px rgba(0,0,0,0.18) inset',
-          flex: '0 0 auto',
-        }}
-        aria-hidden="true"
-      >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'flex-end',
-            gap: barGap,
-            height: maxH,
-          }}
-        >
-          {Array.from({ length: bars }).map((_, i) => {
-            const jitter = ((props.seed >>> (i % 16)) & 0x7) / 7 // 0..1
-            const h = Math.round(baseH + jitter * (maxH - baseH))
-            const on = i < active
-            const col = colorForIndex(i)
-
-            return (
-              <div
-                key={i}
-                style={{
-                  width: barW,
-                  height: h,
-                  borderRadius: 999,
-                  background: on ? col : 'rgba(255,255,255,0.08)',
-                  boxShadow: on
-                    ? `0 0 10px ${col.replace('0.85', '0.18')}`
-                    : 'none',
-                  opacity: on ? 1 : 0.85,
-                }}
-              />
-            )
-          })}
-        </div>
-      </div>
-
-      <div style={{ minWidth: 0 }}>
-        <div
-          style={{
-            fontSize: compact ? '1.65rem' : '2rem',
-            fontWeight: 900,
-            lineHeight: 1,
-          }}
-        >
-          {pct.toFixed(0)}%
-        </div>
-        <div
-          style={{
-            fontSize: compact ? '0.82rem' : '0.9rem',
-            opacity: 0.78,
-            marginTop: 4,
-          }}
-        >
-          Bandwidth in use (mock)
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
-  const a = ((angleDeg - 90) * Math.PI) / 180
-  return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) }
-}
-
-function describeArc(
-  cx: number,
-  cy: number,
-  r: number,
-  startAngle: number,
-  endAngle: number,
-) {
-  const s = polarToCartesian(cx, cy, r, startAngle)
-  const e = polarToCartesian(cx, cy, r, endAngle)
-  const largeArcFlag = Math.abs(endAngle - startAngle) <= 180 ? '0' : '1'
-  return `M ${s.x} ${s.y} A ${r} ${r} 0 ${largeArcFlag} 1 ${e.x} ${e.y}`
-}
-
-// -------------------- planes helpers (for summary pills) --------------------
-
-function planeRestarts(p: any): number {
-  const a = p?.restarts
-  if (typeof a === 'number' && Number.isFinite(a)) return a
-  const b = p?.restart_count
-  if (typeof b === 'number' && Number.isFinite(b)) return b
-  const c = p?.restartCount
-  if (typeof c === 'number' && Number.isFinite(c)) return c
-  return 0
-}
-
-function planeReadyBool(p: any): boolean | null {
-  const r = p?.ready
-  if (typeof r === 'boolean') return r
-  if (typeof r === 'string') {
-    const s = r.toLowerCase().trim()
-    if (s === 'ready' || s === 'true' || s === 'ok') return true
-    if (s === 'not_ready' || s === 'not ready' || s === 'false') return false
-  }
-  return null
-}
-
-function planeHealthNorm(p: any): Health | 'unknown' {
-  const h = String(p?.health ?? '').toLowerCase().trim()
-  if (h === 'healthy') return 'healthy'
-  if (h === 'degraded') return 'degraded'
-  if (h === 'down') return 'down'
-  return 'unknown'
-}
-
-function Pill(props: { tone: 'ok' | 'warn' | 'bad' | 'muted'; children: React.ReactNode }) {
-  const map: Record<typeof props.tone, { bg: string; fg: string; bd: string }> = {
-    ok: {
-      bg: 'rgba(16,185,129,0.10)',
-      fg: 'rgba(110,231,183,0.95)',
-      bd: 'rgba(16,185,129,0.22)',
-    },
-    warn: {
-      bg: 'rgba(251,146,60,0.10)',
-      fg: 'rgba(253,186,116,0.95)',
-      bd: 'rgba(251,146,60,0.24)',
-    },
-    bad: {
-      bg: 'rgba(244,63,94,0.10)',
-      fg: 'rgba(253,164,175,0.95)',
-      bd: 'rgba(244,63,94,0.24)',
-    },
-    muted: {
-      bg: 'rgba(255,255,255,0.04)',
-      fg: 'rgba(255,255,255,0.85)',
-      bd: 'rgba(255,255,255,0.10)',
-    },
-  }
-  const c = map[props.tone]
-  return (
-    <span
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 6,
-        padding: '4px 8px',
-        borderRadius: 999,
-        fontSize: 12,
-        fontWeight: 850,
-        background: c.bg,
-        color: c.fg,
-        border: `1px solid ${c.bd}`,
-        whiteSpace: 'nowrap',
-      }}
-    >
-      {props.children}
-    </span>
-  )
+  return { cpuPct, ramPct, storagePct, bandwidthPct }
 }
 
 export function NodeDetailPage() {
-  const { t } = useI18n()
   const params = useParams<{ id: string }>()
   const nodeId = params.id ?? ''
 
-  const [status, setStatus] = useState<AdminStatusView | null>(null)
-  const [statusLoading, setStatusLoading] = useState(true)
-  const [statusError, setStatusError] = useState<string | null>(null)
+  const {
+    status,
+    statusLoading,
+    statusError,
 
-  const [facets, setFacets] = useState<FacetMetricsSummary[] | null>(null)
-  const [facetsLoading, setFacetsLoading] = useState(true)
-  const [facetsError, setFacetsError] = useState<string | null>(null)
+    facets,
+    facetsLoading,
+    facetsError,
+    facetHistory,
 
-  const [facetHistory, setFacetHistory] = useState<Record<string, number[]>>({})
+    identityLoading,
+    identityError,
 
-  const [readOnlyUi, setReadOnlyUi] = useState(true)
-  const [roles, setRoles] = useState<string[]>([])
-  const [identityError, setIdentityError] = useState<string | null>(null)
-  const [identityLoading, setIdentityLoading] = useState(true)
+    canMutate,
+    actionInFlight,
+    actionMessage,
+    actionError,
+    runAction,
 
-  const [actionInFlight, setActionInFlight] =
-    useState<'reload' | 'shutdown' | null>(null)
-  const [actionMessage, setActionMessage] = useState<string | null>(null)
-  const [actionError, setActionError] = useState<string | null>(null)
-
-  const devDebugEnabled = import.meta.env.DEV
-  const [debugPlane, setDebugPlane] = useState<string>('')
-  const [debugInFlight, setDebugInFlight] = useState(false)
-  const [debugMessage, setDebugMessage] = useState<string | null>(null)
-  const [debugError, setDebugError] = useState<string | null>(null)
-
-  const mountedRef = useRef(true)
-  const statusInFlightRef = useRef(false)
-  const facetsInFlightRef = useRef(false)
-
-  const STATUS_POLL_MS = 5_000
-  const FACETS_POLL_MS = 5_000
-  const MAX_SPARK_POINTS = 40
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
-  }, [])
+    devDebugEnabled,
+    debugPlane,
+    setDebugPlane,
+    debugInFlight,
+    debugMessage,
+    debugError,
+    runDebugCrash,
+  } = useNodeDetail(nodeId)
 
   const planes: any[] = useMemo(
     () => ((status as any)?.planes as any[]) ?? [],
     [status],
   )
 
-  const overallHealth: Health | null = useMemo(() => {
+  const overallHealth = useMemo(() => {
     if (!status) return null
     return deriveOverallHealth(planes)
   }, [status, planes])
@@ -679,11 +227,9 @@ export function NodeDetailPage() {
 
   const minSampleAgeSecs: number | null = useMemo(() => {
     if (!facets || facets.length === 0) return null
-
     const ages = facets
       .map((f) => f.last_sample_age_secs)
       .filter((v): v is number => v !== null && Number.isFinite(v))
-
     if (ages.length === 0) return null
     return Math.min(...ages)
   }, [facets])
@@ -695,211 +241,11 @@ export function NodeDetailPage() {
     nodeId
 
   const utilSeed = useMemo(() => seedFromString(nodeId || 'node'), [nodeId])
-  const { cpuPct, ramPct, storagePct, bandwidthPct } = useMemo(
-    () => mockNodeUtilization(nodeId),
-    [nodeId],
-  )
 
-  // planes summary pills
-  const planeSummary = useMemo(() => {
-    const total = planes.length
-    const ready = planes.filter((p) => planeReadyBool(p) === true).length
-    const degraded = planes.filter((p) => planeHealthNorm(p) === 'degraded').length
-    const down = planes.filter((p) => planeHealthNorm(p) === 'down').length
-    const restarts = planes.reduce((acc, p) => acc + planeRestarts(p), 0)
-    return { total, ready, degraded, down, restarts }
-  }, [planes])
+  // ✅ Live utilization (CPU/RAM/NET + storage when available) with mock fallback
+  const { cpuPct, ramPct, storagePct, bandwidthPct } = useLiveUtilization(nodeId)
 
-  useEffect(() => {
-    if (planes.length > 0 && !debugPlane) {
-      setDebugPlane(planes[0].name)
-    }
-  }, [planes, debugPlane])
-
-  async function refreshStatus(opts?: { initial?: boolean }) {
-    if (!nodeId) return
-    if (statusInFlightRef.current) return
-    statusInFlightRef.current = true
-
-    const initial = opts?.initial ?? false
-
-    try {
-      if (initial) {
-        setStatus(null)
-        setStatusError(null)
-        setStatusLoading(true)
-      } else {
-        setStatusError(null)
-      }
-
-      const data = await adminClient.getNodeStatus(nodeId)
-      if (!mountedRef.current) return
-      setStatus(data)
-    } catch (err) {
-      if (!mountedRef.current) return
-      setStatusError(
-        err instanceof Error ? err.message : 'Failed to load node status.',
-      )
-    } finally {
-      statusInFlightRef.current = false
-      if (!mountedRef.current) return
-      if (initial) setStatusLoading(false)
-    }
-  }
-
-  async function refreshFacets(opts?: { initial?: boolean }) {
-    if (!nodeId) return
-    if (facetsInFlightRef.current) return
-    facetsInFlightRef.current = true
-
-    const initial = opts?.initial ?? false
-
-    try {
-      if (initial) {
-        setFacets(null)
-        setFacetsError(null)
-        setFacetsLoading(true)
-      } else {
-        setFacetsError(null)
-      }
-
-      const data = await adminClient.getNodeFacetMetrics(nodeId)
-      if (!mountedRef.current) return
-
-      setFacets(data)
-
-      setFacetHistory((prev) => {
-        const next: Record<string, number[]> = { ...prev }
-
-        for (const facet of data) {
-          const key = facet.facet
-          const prevSeries = prev[key] ?? []
-          const updated = [...prevSeries, facet.rps]
-          next[key] =
-            updated.length > MAX_SPARK_POINTS
-              ? updated.slice(updated.length - MAX_SPARK_POINTS)
-              : updated
-        }
-
-        return next
-      })
-    } catch (err) {
-      if (!mountedRef.current) return
-      setFacetsError(
-        err instanceof Error
-          ? err.message
-          : 'Failed to load facet metrics for this node.',
-      )
-    } finally {
-      facetsInFlightRef.current = false
-      if (!mountedRef.current) return
-      if (initial) setFacetsLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    if (!nodeId) return
-
-    void refreshStatus({ initial: true })
-    const t = window.setInterval(() => void refreshStatus(), STATUS_POLL_MS)
-    return () => window.clearInterval(t)
-  }, [nodeId])
-
-  useEffect(() => {
-    if (!nodeId) return
-
-    void refreshFacets({ initial: true })
-    const t = window.setInterval(() => void refreshFacets(), FACETS_POLL_MS)
-    return () => window.clearInterval(t)
-  }, [nodeId])
-
-  useEffect(() => {
-    let cancelled = false
-
-    setIdentityError(null)
-    setIdentityLoading(true)
-
-    ;(async () => {
-      try {
-        const [uiConfig, me] = await Promise.all([
-          adminClient.getUiConfig(),
-          adminClient.getMe(),
-        ])
-        if (cancelled) return
-        setReadOnlyUi(uiConfig.readOnly)
-        setRoles(me.roles)
-      } catch (err) {
-        if (cancelled) return
-        setIdentityError(
-          err instanceof Error
-            ? err.message
-            : 'Failed to load identity / UI configuration.',
-        )
-      } finally {
-        if (!cancelled) setIdentityLoading(false)
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  const canMutate =
-    !readOnlyUi && roles.some((role) => role === 'admin' || role === 'ops')
-
-  async function runAction(kind: 'reload' | 'shutdown') {
-    if (!status) return
-
-    setActionInFlight(kind)
-    setActionError(null)
-    setActionMessage(null)
-
-    try {
-      let response: NodeActionResponse
-      if (kind === 'reload') {
-        response = await adminClient.reloadNode(status.id)
-      } else {
-        response = await adminClient.shutdownNode(status.id)
-      }
-
-      setActionMessage(response.message ?? 'Action completed successfully.')
-      await Promise.allSettled([refreshStatus(), refreshFacets()])
-    } catch (err) {
-      setActionError(
-        err instanceof Error
-          ? err.message
-          : 'Action failed. See logs for more detail.',
-      )
-    } finally {
-      setActionInFlight(null)
-    }
-  }
-
-  async function runDebugCrash() {
-    if (!status || !debugPlane) return
-
-    setDebugInFlight(true)
-    setDebugError(null)
-    setDebugMessage(null)
-
-    try {
-      const service = serviceForPlane(debugPlane)
-      const response = await adminClient.debugCrashNode(status.id, service)
-      setDebugMessage(
-        response.message ?? `Synthetic crash event sent for service "${service}".`,
-      )
-      await Promise.allSettled([refreshStatus(), refreshFacets()])
-    } catch (err) {
-      setDebugError(
-        err instanceof Error
-          ? err.message
-          : 'Failed to trigger synthetic crash for this node.',
-      )
-    } finally {
-      setDebugInFlight(false)
-    }
-  }
+  const planeSummary = useMemo(() => computePlaneSummary(planes), [planes])
 
   if (statusLoading && facetsLoading && identityLoading) {
     return (
@@ -941,7 +287,6 @@ export function NodeDetailPage() {
     <div className="svc-admin-page svc-admin-page-node-detail">
       <header className="svc-admin-page-header svc-admin-page-header-node">
         <div>
-          {/* ✅ Back link in top-left above the title */}
           <div style={{ marginBottom: 8 }}>
             <Link to="/" className="svc-admin-link-muted">
               ← Back
@@ -969,7 +314,6 @@ export function NodeDetailPage() {
           </p>
         </div>
 
-        {/* ✅ Right side: only badges now */}
         <div className="svc-admin-page-header-actions">
           {metricsHealth && renderMetricsBadge(metricsHealth)}
           {overallHealth && <NodeStatusBadge status={overallHealth} />}
@@ -997,10 +341,8 @@ export function NodeDetailPage() {
       )}
 
       <div className="svc-admin-node-detail-layout">
-        {/* LEFT: main operational view */}
         <div className="svc-admin-node-detail-main">
           <section className="svc-admin-section svc-admin-section-node-overview">
-            {/* ✅ “Cooler” planes header + summary pills */}
             <div
               style={{
                 display: 'flex',
@@ -1013,15 +355,15 @@ export function NodeDetailPage() {
               <h2 style={{ margin: 0 }}>Planes</h2>
 
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <Pill tone={planeSummary.ready === planeSummary.total ? 'ok' : 'warn'}>
+                <Pill
+                  tone={planeSummary.ready === planeSummary.total ? 'ok' : 'warn'}
+                >
                   {planeSummary.ready}/{planeSummary.total} Ready
                 </Pill>
                 {planeSummary.degraded > 0 && (
                   <Pill tone="warn">{planeSummary.degraded} Degraded</Pill>
                 )}
-                {planeSummary.down > 0 && (
-                  <Pill tone="bad">{planeSummary.down} Down</Pill>
-                )}
+                {planeSummary.down > 0 && <Pill tone="bad">{planeSummary.down} Down</Pill>}
                 <Pill tone="muted">{planeSummary.restarts} Restarts</Pill>
               </div>
             </div>
@@ -1039,7 +381,6 @@ export function NodeDetailPage() {
                 overflow: 'hidden',
               }}
             >
-              {/* subtle accent rail */}
               <div
                 aria-hidden="true"
                 style={{
@@ -1066,24 +407,11 @@ export function NodeDetailPage() {
                   flexWrap: 'wrap',
                 }}
               >
-                {/* Plane table */}
-                <div
-                  style={{
-                    flex: '0 0 340px',
-                    maxWidth: 440,
-                    minWidth: 300,
-                  }}
-                >
+                <div style={{ flex: '0 0 340px', maxWidth: 440, minWidth: 300 }}>
                   <PlaneStatusTable planes={planes} />
                 </div>
 
-                {/* 2x2 compact grid: CPU | RAM  then  Storage | Bandwidth */}
-                <div
-                  style={{
-                    flex: '1 1 520px',
-                    minWidth: 520,
-                  }}
-                >
+                <div style={{ flex: '1 1 520px', minWidth: 520 }}>
                   <div
                     style={{
                       display: 'grid',
@@ -1105,11 +433,7 @@ export function NodeDetailPage() {
                     </MiniMetricCard>
 
                     <MiniMetricCard title="Bandwidth">
-                      <BandwidthBarsGauge
-                        pct={bandwidthPct}
-                        seed={utilSeed}
-                        compact
-                      />
+                      <BandwidthBarsGauge pct={bandwidthPct} seed={utilSeed} compact />
                     </MiniMetricCard>
                   </div>
                 </div>
@@ -1141,9 +465,7 @@ export function NodeDetailPage() {
                 disabled={!canMutate || actionInFlight !== null}
                 onClick={() => runAction('reload')}
               >
-                {actionInFlight === 'reload'
-                  ? 'Reloading…'
-                  : 'Reload node configuration'}
+                {actionInFlight === 'reload' ? 'Reloading…' : 'Reload node configuration'}
               </button>
 
               <button
@@ -1152,15 +474,11 @@ export function NodeDetailPage() {
                 disabled={!canMutate || actionInFlight !== null}
                 onClick={() => runAction('shutdown')}
               >
-                {actionInFlight === 'shutdown'
-                  ? 'Shutting down…'
-                  : 'Shutdown node'}
+                {actionInFlight === 'shutdown' ? 'Shutting down…' : 'Shutdown node'}
               </button>
             </div>
 
-            {actionMessage && (
-              <p className="svc-admin-node-actions-message">{actionMessage}</p>
-            )}
+            {actionMessage && <p className="svc-admin-node-actions-message">{actionMessage}</p>}
             {actionError && <ErrorBanner message={actionError} />}
           </section>
 
@@ -1168,18 +486,14 @@ export function NodeDetailPage() {
             <section className="svc-admin-section svc-admin-section-node-debug">
               <h2>Debug controls</h2>
               <p className="svc-admin-node-actions-caption">
-                Dev-only synthetic crash tool. This emits a crash event for the
-                selected plane without killing a real worker. Do not expose in
-                production.
+                Dev-only synthetic crash tool. This emits a crash event for the selected plane
+                without killing a real worker. Do not expose in production.
               </p>
 
               <div className="svc-admin-node-debug-controls">
                 <label>
                   Plane to crash:{' '}
-                  <select
-                    value={debugPlane}
-                    onChange={(e) => setDebugPlane(e.target.value)}
-                  >
+                  <select value={debugPlane} onChange={(e) => setDebugPlane(e.target.value)}>
                     {planes.map((plane) => (
                       <option key={plane.name} value={plane.name}>
                         {plane.name}
@@ -1194,25 +508,20 @@ export function NodeDetailPage() {
                   disabled={debugInFlight}
                   onClick={runDebugCrash}
                 >
-                  {debugInFlight
-                    ? 'Triggering crash…'
-                    : 'Trigger synthetic crash'}
+                  {debugInFlight ? 'Triggering crash…' : 'Trigger synthetic crash'}
                 </button>
               </div>
 
-              {debugMessage && (
-                <p className="svc-admin-node-actions-message">{debugMessage}</p>
-              )}
+              {debugMessage && <p className="svc-admin-node-actions-message">{debugMessage}</p>}
               {debugError && <ErrorBanner message={debugError} />}
             </section>
           )}
         </div>
 
-        {/* RIGHT: data-plane + playground sidebar */}
         <aside className="svc-admin-node-detail-sidebar">
           <NodeDetailSidebar
             status={status}
-            planes={planes} // ✅ new: enables richer Data planes card
+            planes={planes}
             metricsHealth={metricsHealth}
             minSampleAgeSecs={minSampleAgeSecs}
             loading={statusLoading || facetsLoading}

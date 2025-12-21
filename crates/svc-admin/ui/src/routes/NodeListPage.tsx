@@ -11,15 +11,14 @@
 //   - NodePreviewPanel                 → right-hand preview pane
 //   - LoadingSpinner / ErrorBanner / EmptyState
 //   - i18n/useI18n for copy
+//
+// RO:UX — Add a top “freshness strip” so operators can tell at a glance whether
+//        the dashboard is live, stale, or unreachable before deep-diving.
+//
+// NOTE: This is intentionally lightweight: it only depends on metricsById health
+//       which is already computed by the polling hooks.
 
-import React, { useEffect, useState } from 'react'
-import { adminClient } from '../api/adminClient'
-import type {
-  AdminStatusView,
-  NodeSummary,
-  PlaneStatus,
-  FacetMetricsSummary,
-} from '../types/admin-api'
+import React, { useMemo } from 'react'
 import {
   NodeCard,
   type NodeStatusSummary,
@@ -31,254 +30,131 @@ import { ErrorBanner } from '../components/shared/ErrorBanner'
 import { EmptyState } from '../components/shared/EmptyState'
 import { useI18n } from '../i18n/useI18n'
 
-type Health = 'healthy' | 'degraded' | 'down'
+import { useNodeListData } from './node-list/useNodeListData'
+import { buildSummary } from './node-list/helpers'
 
-type NodeStatusState = {
-  loading: boolean
-  error: string | null
-  status: AdminStatusView | null
-}
+function MetricsPill({
+  label,
+  count,
+  tone,
+}: {
+  label: string
+  count: number
+  tone: 'ok' | 'warn' | 'bad' | 'muted'
+}) {
+  const style: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '6px 10px',
+    borderRadius: 999,
+    border: '1px solid var(--svc-admin-color-border, rgba(255,255,255,0.14))',
+    background:
+      tone === 'ok'
+        ? 'rgba(16,185,129,0.14)'
+        : tone === 'warn'
+          ? 'rgba(251,146,60,0.14)'
+          : tone === 'bad'
+            ? 'rgba(244,63,94,0.14)'
+            : 'rgba(255,255,255,0.06)',
+    color:
+      tone === 'ok'
+        ? 'rgba(167,243,208,0.95)'
+        : tone === 'warn'
+          ? 'rgba(254,215,170,0.95)'
+          : tone === 'bad'
+            ? 'rgba(253,164,175,0.95)'
+            : 'rgba(226,232,240,0.92)',
+    fontSize: 13,
+    lineHeight: 1.2,
+    whiteSpace: 'nowrap',
+  }
 
-type NodeMetricsState = {
-  loading: boolean
-  error: string | null
-  health: MetricsHealth | null
-}
+  const bubbleStyle: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 22,
+    height: 18,
+    padding: '0 6px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.14)',
+    background: 'rgba(0,0,0,0.18)',
+    fontVariantNumeric: 'tabular-nums',
+  }
 
-function deriveOverallHealth(planes: PlaneStatus[]): Health {
-  if (!planes.length) return 'degraded'
-  if (planes.some((p) => p.health === 'down')) return 'down'
-  if (planes.some((p) => p.health === 'degraded')) return 'degraded'
-  return 'healthy'
-}
-
-function buildSummary(
-  status: AdminStatusView | null,
-): NodeStatusSummary | undefined {
-  if (!status) return undefined
-
-  const planeCount = status.planes.length
-  const readyCount = status.planes.filter((p) => p.ready).length
-  const totalRestarts = status.planes.reduce(
-    (sum, p) => sum + (p.restart_count ?? 0),
-    0,
+  return (
+    <span style={style}>
+      <span style={bubbleStyle}>{count}</span>
+      {label}
+    </span>
   )
-
-  return {
-    overallHealth: deriveOverallHealth(status.planes),
-    planeCount,
-    readyCount,
-    totalRestarts,
-  }
-}
-
-function classifyMetricsHealth(
-  facets: FacetMetricsSummary[] | null,
-  error: string | null,
-): MetricsHealth | null {
-  if (error) {
-    return 'unreachable'
-  }
-
-  if (!facets || facets.length === 0) {
-    // Node may be idle or just starting; treat as stale for now.
-    return 'stale'
-  }
-
-  const ages = facets
-    .map((f) => f.last_sample_age_secs)
-    .filter((v): v is number => v !== null && Number.isFinite(v))
-
-  if (ages.length === 0) {
-    return 'stale'
-  }
-
-  const minAge = Math.min(...ages)
-  const FRESH_THRESHOLD_SECS = 30
-
-  if (minAge <= FRESH_THRESHOLD_SECS) {
-    return 'fresh'
-  }
-
-  return 'stale'
 }
 
 export function NodeListPage() {
   const { t } = useI18n()
 
-  const [nodes, setNodes] = useState<NodeSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const {
+    nodes,
+    loading,
+    error,
 
-  const [statusById, setStatusById] = useState<Record<string, NodeStatusState>>(
-    {},
+    statusById,
+    metricsById,
+
+    effectiveSelectedId,
+    selectedNode,
+    selectedStatusState,
+    selectedMetricsState,
+    setSelectedNodeId,
+  } = useNodeListData()
+
+  const selectedSummary: NodeStatusSummary | undefined = buildSummary(
+    selectedStatusState?.status ?? null,
   )
-  const [metricsById, setMetricsById] = useState<
-    Record<string, NodeMetricsState>
-  >({})
 
-  // which node is currently selected for the right-hand preview.
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-
-  // --- Load node registry --------------------------------------------------
-
-  useEffect(() => {
-    let cancelled = false
-
-    setLoading(true)
-    setError(null)
-
-    ;(async () => {
-      try {
-        const data = await adminClient.getNodes()
-        if (cancelled) return
-
-        setNodes(data)
-
-        // Default selection: first node in the list.
-        if (!selectedNodeId && data.length > 0) {
-          setSelectedNodeId(data[0].id)
-        }
-      } catch (err) {
-        if (cancelled) return
-        const msg = err instanceof Error ? err.message : 'Failed to load nodes.'
-        setError(msg)
-      } finally {
-        if (!cancelled) {
-          setLoading(false)
-        }
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-    // deliberately *not* including selectedNodeId here; we only want to
-    // apply the default once when the nodes first load.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // --- Load per-node status in the background -----------------------------
-
-  useEffect(() => {
-    if (!nodes.length) return
-
-    let cancelled = false
-
-    async function loadStatuses() {
-      for (const node of nodes) {
-        const id = node.id
-
-        setStatusById((prev) => ({
-          ...prev,
-          [id]: prev[id] ?? { loading: true, error: null, status: null },
-        }))
-
-        try {
-          const data = await adminClient.getNodeStatus(id)
-          if (cancelled) return
-
-          setStatusById((prev) => ({
-            ...prev,
-            [id]: { loading: false, error: null, status: data },
-          }))
-        } catch (err) {
-          if (cancelled) return
-          const msg =
-            err instanceof Error ? err.message : 'Failed to load node status'
-          setStatusById((prev) => ({
-            ...prev,
-            [id]: { loading: false, error: msg, status: null },
-          }))
-        }
-      }
-    }
-
-    loadStatuses()
-
-    return () => {
-      cancelled = true
-    }
-  }, [nodes])
-
-  // --- Load per-node metrics freshness in the background -------------------
-
-  useEffect(() => {
-    if (!nodes.length) return
-
-    let cancelled = false
-
-    async function loadMetrics() {
-      for (const node of nodes) {
-        const id = node.id
-
-        setMetricsById((prev) => ({
-          ...prev,
-          [id]: prev[id] ?? { loading: true, error: null, health: null },
-        }))
-
-        try {
-          const data = await adminClient.getNodeFacetMetrics(id)
-          if (cancelled) return
-
-          const health = classifyMetricsHealth(data, null)
-
-          setMetricsById((prev) => ({
-            ...prev,
-            [id]: { loading: false, error: null, health },
-          }))
-        } catch (err) {
-          if (cancelled) return
-          const msg =
-            err instanceof Error ? err.message : 'Failed to load facet metrics'
-
-          const health: MetricsHealth = 'unreachable'
-
-          setMetricsById((prev) => ({
-            ...prev,
-            [id]: { loading: false, error: msg, health },
-          }))
-        }
-      }
-    }
-
-    loadMetrics()
-
-    return () => {
-      cancelled = true
-    }
-  }, [nodes])
-
-  // --- Derived view-model for selected node --------------------------------
-
-  const effectiveSelectedId =
-    selectedNodeId || (nodes.length > 0 ? nodes[0].id : null)
-
-  const selectedNode =
-    effectiveSelectedId != null
-      ? nodes.find((n) => n.id === effectiveSelectedId) ?? null
-      : null
-
-  const selectedStatusState =
-    selectedNode != null ? statusById[selectedNode.id] : undefined
-  const selectedMetricsState =
-    selectedNode != null ? metricsById[selectedNode.id] : undefined
-
-  const selectedSummary = buildSummary(selectedStatusState?.status ?? null)
-
-  // ✅ This is what the preview needs in order to render the Planes table.
   const selectedPlanes = selectedStatusState?.status?.planes ?? null
 
-  // --- Render ---------------------------------------------------------------
+  const metricsCounts = useMemo(() => {
+    let fresh = 0
+    let stale = 0
+    let unreachable = 0
+    let unknown = 0
+
+    for (const n of nodes) {
+      const h = (metricsById[n.id]?.health ?? null) as MetricsHealth | null
+      if (h === 'fresh') fresh += 1
+      else if (h === 'stale') stale += 1
+      else if (h === 'unreachable') unreachable += 1
+      else unknown += 1
+    }
+
+    return { fresh, stale, unreachable, unknown }
+  }, [metricsById, nodes])
 
   return (
     <div className="svc-admin-page svc-admin-page-nodes">
       <header className="svc-admin-page-header">
-        <h1>{t('nav.nodes')}</h1>
-        <p>
-          Overview of nodes registered in this svc-admin instance, including
-          quick health, restart, and metrics freshness summaries.
-        </p>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+          <div>
+            <h1>{t('nav.nodes')}</h1>
+            <p>
+              Overview of nodes registered in this svc-admin instance, including
+              quick health, restart, and metrics freshness summaries.
+            </p>
+          </div>
+
+          {!loading && !error && nodes.length > 0 && (
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+              <MetricsPill label="Fresh" count={metricsCounts.fresh} tone="ok" />
+              <MetricsPill label="Stale" count={metricsCounts.stale} tone="warn" />
+              <MetricsPill label="Unreachable" count={metricsCounts.unreachable} tone="bad" />
+              {metricsCounts.unknown > 0 && (
+                <MetricsPill label="Unknown" count={metricsCounts.unknown} tone="muted" />
+              )}
+            </div>
+          )}
+        </div>
       </header>
 
       {loading && <LoadingSpinner />}
