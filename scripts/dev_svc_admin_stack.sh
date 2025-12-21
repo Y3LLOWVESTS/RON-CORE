@@ -13,7 +13,7 @@ say() {
   printf '[dev-stack] %s\n' "$*"
 }
 
-# Default addresses (can be overridden with env).
+# Default addresses (can be overridden with env if you really want).
 MACRONODE_HTTP_ADDR="${RON_HTTP_ADDR:-127.0.0.1:8080}"
 MACRONODE_METRICS_ADDR="${RON_METRICS_ADDR:-${MACRONODE_HTTP_ADDR}}"
 
@@ -23,8 +23,9 @@ SVC_ADMIN_METRICS_ADDR_DEFAULT="127.0.0.1:5310"
 SVC_ADMIN_HTTP_ADDR="${SVC_ADMIN_HTTP_ADDR:-${SVC_ADMIN_HTTP_ADDR_DEFAULT}}"
 SVC_ADMIN_METRICS_ADDR="${SVC_ADMIN_METRICS_ADDR:-${SVC_ADMIN_METRICS_ADDR_DEFAULT}}"
 
-MACRONODE_BASE_URL="http://${MACRONODE_HTTP_ADDR}"
-SVC_ADMIN_BASE_URL="http://${SVC_ADMIN_HTTP_ADDR}"
+# Dev-only: enable the app playground (default ON for this dev stack).
+# You can override: SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND=false ./your-script.sh
+SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND="${SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND:-true}"
 
 # PIDs for cleanup.
 MACRONODE_PID=""
@@ -38,43 +39,13 @@ cleanup() {
       kill "${pid}" 2>/dev/null || true
     fi
   done
+
+  # Wait for children to exit to avoid zombie processes.
   wait 2>/dev/null || true
   say "Done."
 }
 
-trap cleanup EXIT INT TERM
-
-require_alive() {
-  local name="$1"
-  local pid="$2"
-  if [[ -z "${pid}" ]]; then
-    say "ERROR: ${name} PID is empty"
-    exit 1
-  fi
-  if ! kill -0 "${pid}" 2>/dev/null; then
-    say "ERROR: ${name} exited early (pid=${pid}). Scroll up for logs."
-    exit 1
-  fi
-}
-
-wait_for_http() {
-  local url="$1"
-  local label="$2"
-  local tries="${3:-80}"     # ~40s at 0.5s/try
-  local delay="${4:-0.5}"
-
-  say "Waiting for ${label}: ${url}"
-  for _ in $(seq 1 "${tries}"); do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
-      say "${label} is up."
-      return 0
-    fi
-    sleep "${delay}"
-  done
-
-  say "ERROR: Timed out waiting for ${label}: ${url}"
-  return 1
-}
+trap cleanup INT TERM
 
 cd "${ROOT_DIR}"
 
@@ -83,10 +54,12 @@ say "macronode admin HTTP: ${MACRONODE_HTTP_ADDR}"
 say "svc-admin UI/API:    ${SVC_ADMIN_HTTP_ADDR}"
 say "svc-admin metrics:   ${SVC_ADMIN_METRICS_ADDR}"
 say "SPA dev server:      http://localhost:5173"
+say "Playground flag:     SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND=${SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND}"
+
 echo
 
 # ---------------------------------------------------------------------------
-# 1) Start macronode
+# 1) Start macronode (admin plane + metrics on same port)
 # ---------------------------------------------------------------------------
 (
   cd "${ROOT_DIR}"
@@ -94,14 +67,10 @@ echo
   RON_HTTP_ADDR="${MACRONODE_HTTP_ADDR}" \
   RON_METRICS_ADDR="${MACRONODE_METRICS_ADDR}" \
   MACRONODE_DEV_INSECURE=1 \
-  cargo run -p macronode --bin macronode
+  cargo run -p macronode
 ) &
 MACRONODE_PID=$!
 say "macronode PID: ${MACRONODE_PID}"
-
-# Wait for macronode admin plane (has /healthz)
-wait_for_http "${MACRONODE_BASE_URL}/healthz" "macronode /healthz" 120 0.5
-require_alive "macronode" "${MACRONODE_PID}"
 
 # ---------------------------------------------------------------------------
 # 2) Start svc-admin (backend API + metrics listener)
@@ -111,16 +80,13 @@ require_alive "macronode" "${MACRONODE_PID}"
   say "Starting svc-admin..."
   SVC_ADMIN_HTTP_ADDR="${SVC_ADMIN_HTTP_ADDR}" \
   SVC_ADMIN_METRICS_ADDR="${SVC_ADMIN_METRICS_ADDR}" \
-  SVC_ADMIN_NODES__EXAMPLE_NODE__BASE_URL="${MACRONODE_BASE_URL}" \
-  SVC_ADMIN_NODES__EXAMPLE_NODE__METRICS_URL="${MACRONODE_BASE_URL}/metrics" \
+  SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND="${SVC_ADMIN_UI_DEV_ENABLE_APP_PLAYGROUND}" \
+  SVC_ADMIN_NODES__EXAMPLE_NODE__BASE_URL="http://${MACRONODE_HTTP_ADDR}" \
+  SVC_ADMIN_NODES__EXAMPLE_NODE__METRICS_URL="http://${MACRONODE_HTTP_ADDR}/metrics" \
   cargo run -p svc-admin --bin svc-admin
 ) &
 SVC_ADMIN_PID=$!
 say "svc-admin PID: ${SVC_ADMIN_PID}"
-
-# Wait for svc-admin API to respond (ui-config should be unauth / dev-safe)
-wait_for_http "${SVC_ADMIN_BASE_URL}/api/ui-config" "svc-admin /api/ui-config" 240 0.5
-require_alive "svc-admin" "${SVC_ADMIN_PID}"
 
 # ---------------------------------------------------------------------------
 # 3) Start svc-admin UI (Vite dev server)
@@ -134,10 +100,11 @@ UI_PID=$!
 say "UI dev server PID: ${UI_PID}"
 
 echo
-say "Dev stack is up."
-say "Open SPA:            http://localhost:5173"
-say "svc-admin API:       ${SVC_ADMIN_BASE_URL}"
-say "macronode admin:     ${MACRONODE_BASE_URL}"
-echo
+say "Dev stack is starting up..."
+say "Open the SPA in your browser at: http://localhost:5173"
+say "Playground page (SPA):          http://localhost:5173/playground"
+say "svc-admin API is at:            http://${SVC_ADMIN_HTTP_ADDR}"
+say "macronode admin plane is at:    http://${MACRONODE_HTTP_ADDR}"
 
+# Block until children exit (Ctrl-C to stop).
 wait
