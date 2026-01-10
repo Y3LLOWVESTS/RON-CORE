@@ -2,16 +2,14 @@
 # RON-CORE
 >Still in beta build phase
 
->Update 12-3-2025: Typescript, Python, Java, Kotlin, PHP, and Rust sdks are beta complete. We are working on the Swift sdk next.  
->Note: ron-app-sdk is the rust sdk & ron-app-sdk-jvm is the Kotlin & Java sdk. 
->Check the notes file in the sdks for verbose build notes 
->NEW: ron-app-sdk-swift is developer preview complete
->Next task is creating svc-admin so that we can have a dashboard for micronodes and macronodes
-> Please note that RON-CORE is not production ready and not meant for production usage (yet)
+>Update: 1/10/2026:
+>Currently building examples across different use cases, static site example is done (using omnigate) the next example will be a site that uses micronode and the typescript sdk. We will also have examples for swift, kotlin, java, php, rust, and python soon. 
+>Please note that this software is experimental and it is in the proof of concept phase.
+>For more thorough notes and documentation please check out the RustyOnions repo which is the code lab. Within each crate there are running notes and IDB blueprints.
 
-### Check out the developer preview of the admin dashboard
+### Updated dashboard and static site example:
 
-[![Watch the video](https://img.youtube.com/vi/OLHdBZm6lRE/hqdefault.jpg)](https://www.youtube.com/watch?v=OLHdBZm6lRE)
+[![Watch the video](https://img.youtube.com/vi/mN-d3s9HleI/hqdefault.jpg)](https://youtu.be/mN-d3s9HleI)
 
 
 ### Test out the admin dashboard (updated):
