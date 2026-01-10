@@ -1,4 +1,0 @@
-# Public lib API surface (libapi feature)
-OverlayConfig
-OverlayHandle
-spawn(cfg) -> OverlayHandle

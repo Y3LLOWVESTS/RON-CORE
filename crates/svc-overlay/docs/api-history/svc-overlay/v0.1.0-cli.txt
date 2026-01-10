@@ -1,5 +1,0 @@
-# Golden CLI flags (subject to SemVer)
---bind <ADDR>
---max-conns <N>
---config <PATH>
---amnesia <bool>

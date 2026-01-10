@@ -1,5 +1,0 @@
-{
-  "healthz": {"status": "ok"},
-  "readyz": {"ready": true, "reason": ""},
-  "metrics": "<prometheus exposition text>"
-}
